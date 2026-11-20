@@ -5,19 +5,61 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Versi APK Release (contoh: 4.5.0 atau 4.5.1)'
+        required: true
+        default: '4.5.0'
+        type: string
 
 permissions:
   contents: write
 
+concurrency:
+  group: klerek-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   android-release:
-    name: Signed APK & GitHub Release
+    name: APK Release bertanda tangan
     runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
-      - name: Checkout
+      - name: Checkout source
         uses: actions/checkout@v4
-      - name: Ekstrak Android source dari ZIP
+        with:
+          fetch-depth: 0
+
+      - name: Tentukan versi APK
+        id: version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]]; then
+            if [[ "$GITHUB_REF" != 'refs/heads/main' ]]; then
+              echo 'Jalankan workflow manual dari branch main.' >&2
+              exit 1
+            fi
+            VERSION="$REQUESTED_VERSION"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Versi harus seperti 4.5.0 (tanpa huruf v).' >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' ]]; then
+            if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
+              echo "Tag v$VERSION sudah ada. Masukkan nomor versi BARU." >&2
+              exit 1
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Rilis APK versi $VERSION"
+
+      - name: Ekstrak source Android dari ZIP
         shell: bash
         run: |
           set -euo pipefail
@@ -26,15 +68,39 @@ jobs:
           unzip -q -o KLEREK_KASIR_ANDROID_SOURCE.zip -d "$GITHUB_WORKSPACE"
           test -f android/app/build.gradle
           test -f android/app/src/main/assets/web/update-config.json
-      - name: Validasi versi tag dan paket
-        if: startsWith(github.ref, 'refs/tags/')
+
+      - name: Sesuaikan versionName dan versionCode pada APK
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          APP_VERSION="$(sed -nE "s/^[[:space:]]*versionName '([0-9]+\.[0-9]+\.[0-9]+)'.*/\1/p" android/app/build.gradle | head -1)"
-          test -n "$APP_VERSION"
-          test "$GITHUB_REF_NAME" = "v$APP_VERSION" || { echo "Tag harus v$APP_VERSION"; exit 1; }
-      - name: Validate secrets
+          python3 - <<'PY'
+          import os, pathlib, re, sys
+          p = pathlib.Path('android/app/build.gradle')
+          s = p.read_text()
+          major, minor, patch = map(int, os.environ['RELEASE_VERSION'].split('.'))
+          if major > 1000 or minor > 99 or patch > 99:
+              sys.exit('Format versi: major.minor.patch, minor dan patch maksimal 99')
+          version_code = major * 10000 + minor * 100 + patch
+          if version_code > 2100000000:
+              sys.exit('versionCode terlalu besar')
+          m = re.search(r"(?m)^\s*versionName\s+'([^']+)'", s)
+          if not m:
+              sys.exit('versionName tidak ditemukan di build.gradle')
+          current = m.group(1)
+          # Untuk rilis lewat push tag, source dan tag harus sama.
+          if os.environ.get('GITHUB_EVENT_NAME') == 'push' and current != os.environ['RELEASE_VERSION']:
+              sys.exit(f'Tag v{os.environ["RELEASE_VERSION"]} tidak sama dengan source v{current}. Update source ZIP dulu.')
+          s, count1 = re.subn(r'(?m)^(\s*versionCode\s+)\d+(\s*)$', lambda m: m.group(1)+str(version_code)+m.group(2), s, count=1)
+          s, count2 = re.subn(r"(?m)^(\s*versionName\s+)'[^']+'(\s*)$", lambda m: m.group(1)+"'"+os.environ['RELEASE_VERSION']+"'"+m.group(2), s, count=1)
+          if count1 != 1 or count2 != 1:
+              sys.exit('Gagal mengubah versi Gradle dengan aman')
+          p.write_text(s)
+          print(f'APK Release: {current} -> {os.environ["RELEASE_VERSION"]}; versionCode={version_code}')
+          PY
+
+      - name: Pastikan keempat Secrets tersedia
         shell: bash
         env:
           KLEREK_KEYSTORE_BASE64: ${{ secrets.KLEREK_KEYSTORE_BASE64 }}
@@ -43,24 +109,30 @@ jobs:
           KLEREK_KEY_PASSWORD: ${{ secrets.KLEREK_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          test -n "$KLEREK_KEYSTORE_BASE64" || { echo 'Keystore secret belum ada'; exit 1; }
-          test -n "$KLEREK_KEYSTORE_PASSWORD" || { echo 'Password keystore belum ada'; exit 1; }
-          test -n "$KLEREK_KEY_ALIAS" || { echo 'Alias keystore belum ada'; exit 1; }
-          test -n "$KLEREK_KEY_PASSWORD" || { echo 'Password key belum ada'; exit 1; }
+          test -n "$KLEREK_KEYSTORE_BASE64" || { echo 'Secret KLEREK_KEYSTORE_BASE64 belum ada'; exit 1; }
+          test -n "$KLEREK_KEYSTORE_PASSWORD" || { echo 'Secret KLEREK_KEYSTORE_PASSWORD belum ada'; exit 1; }
+          test -n "$KLEREK_KEY_ALIAS" || { echo 'Secret KLEREK_KEY_ALIAS belum ada'; exit 1; }
+          test -n "$KLEREK_KEY_PASSWORD" || { echo 'Secret KLEREK_KEY_PASSWORD belum ada'; exit 1; }
+
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+
       - name: Android SDK
         uses: android-actions/setup-android@v4
-      - name: Android API 35
+
+      - name: Install Android API 35
+        shell: bash
         run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+
       - name: Setup Gradle 8.7
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
-      - name: Restore release keystore for this build only
+
+      - name: Pulihkan keystore saat proses build saja
         shell: bash
         env:
           KLEREK_KEYSTORE_BASE64: ${{ secrets.KLEREK_KEYSTORE_BASE64 }}
@@ -69,13 +141,14 @@ jobs:
           umask 077
           printf '%s' "$KLEREK_KEYSTORE_BASE64" | base64 --decode > android/app/klerek-release.jks
           test -s android/app/klerek-release.jks
-      - name: Build signed APK Release
+
+      - name: Build dan validasi APK Release
+        shell: bash
         env:
           KLEREK_KEYSTORE_PATH: klerek-release.jks
           KLEREK_KEYSTORE_PASSWORD: ${{ secrets.KLEREK_KEYSTORE_PASSWORD }}
           KLEREK_KEY_ALIAS: ${{ secrets.KLEREK_KEY_ALIAS }}
           KLEREK_KEY_PASSWORD: ${{ secrets.KLEREK_KEY_PASSWORD }}
-        shell: bash
         run: |
           set -euo pipefail
           gradle --no-daemon -p android :app:assembleRelease --stacktrace
@@ -84,16 +157,23 @@ jobs:
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify "$APK"
           mkdir -p release
           cp "$APK" release/KLEREK-KASIR.apk
-      - name: Upload Release APK
+
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: KLEREK-KASIR-SIGNED-RELEASE
+          name: KLEREK-KASIR-SIGNED-RELEASE-v${{ steps.version.outputs.version }}
           path: release/KLEREK-KASIR.apk
           if-no-files-found: error
-      - name: Publish GitHub Release on version tag
-        if: startsWith(github.ref, 'refs/tags/')
+
+      - name: Terbitkan GitHub Release untuk notifikasi pembaruan
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: KLEREK KASIR v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
           files: release/KLEREK-KASIR.apk
           generate_release_notes: true
+          draft: false
+          prerelease: false
+          make_latest: true
           fail_on_unmatched_files: true
